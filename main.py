@@ -16,6 +16,7 @@ Expected CSV schema, minimum:
 trial_id,subject_id,timestamp_ms,label,risk_label,session_phase,rpe,load_level,label_quality,
 acc_up_x,acc_up_y,acc_up_z,
 gyro_up_x,gyro_up_y,gyro_up_z,
+mag_up_x,mag_up_y,mag_up_z,
 acc_low_x,acc_low_y,acc_low_z,
 gyro_low_x,gyro_low_y,gyro_low_z,
 mag_low_x,mag_low_y,mag_low_z,
@@ -23,7 +24,7 @@ pitch_up,roll_up,yaw_up,
 pitch_low,roll_low,yaw_low
 
 If pitch/roll/yaw are not available, this script can still run using raw IMU features,
-but physics features related to spine_flexion/spine_roll_delta will be skipped unless orientation is computed later.
+but physics features related to spine_flexion/spine_twist will be skipped unless orientation is computed later.
 """
 
 from __future__ import annotations
@@ -37,18 +38,14 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import joblib
-import matplotlib
 import numpy as np
 import pandas as pd
 from scipy.fft import rfft, rfftfreq
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, confusion_matrix, f1_score, log_loss
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.covariance import EmpiricalCovariance
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 # =========================
@@ -88,22 +85,24 @@ RAW_IMU_COLUMNS = [
     "gyro_low_x", "gyro_low_y", "gyro_low_z",
 ]
 
-MAG_LOW_COLUMNS = ["mag_low_x", "mag_low_y", "mag_low_z"]
+# MAG_COLUMNS = [
+#     "mag_up_x", "mag_up_y", "mag_up_z",
+#     "mag_low_x", "mag_low_y", "mag_low_z",
+# ]
+
+MAG_COLUMNS = [
+    "mag_low_x", "mag_low_y", "mag_low_z",
+]
 
 ORIENTATION_COLUMNS = [
     "pitch_up", "roll_up", "yaw_up",
     "pitch_low", "roll_low", "yaw_low",
 ]
 
-BIOMECH_ORIENTATION_COLUMNS = ["pitch_up", "roll_up", "pitch_low", "roll_low"]
-
 META_COLUMNS = [
     "trial_id", "subject_id", "timestamp_ms", "label", "risk_label",
     "session_phase", "rpe", "load_level", "label_quality",
 ]
-
-REQUIRED_COLUMNS = META_COLUMNS + RAW_IMU_COLUMNS
-OPTIONAL_COLUMNS = MAG_LOW_COLUMNS + ORIENTATION_COLUMNS
 
 
 # Map fine labels from collection into first MVP train classes.
@@ -135,67 +134,19 @@ def safe_numeric(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     return df
 
 
-def validate_required_columns(df: pd.DataFrame, source_name: str) -> None:
-    """Fail early when a CSV is missing columns needed by both MVP models."""
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing:
-        raise ValueError(
-            f"{source_name} is missing required columns: {missing}. "
-            "Orientation and lower magnetometer columns are optional, but metadata and raw accel/gyro columns are required."
-        )
-
-
-def warn_missing_optional_columns(df: pd.DataFrame, source_name: str) -> None:
-    missing = [col for col in OPTIONAL_COLUMNS if col not in df.columns]
-    if missing:
-        warnings.warn(
-            f"{source_name} is missing optional columns: {missing}. "
-            "The pipeline will skip features that depend on them.",
-            stacklevel=2,
-        )
-
-
-def as_numeric_array(df: pd.DataFrame, col: str) -> np.ndarray:
-    return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
-
-
-def finite_or_zero(values: np.ndarray) -> np.ndarray:
-    return np.nan_to_num(np.asarray(values, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def safe_stat(values: np.ndarray, stat: str) -> float:
-    x = np.asarray(values, dtype=float)
-    x = x[np.isfinite(x)]
-    if len(x) == 0:
-        return 0.0
-    if stat == "mean":
-        return float(np.mean(x))
-    if stat == "std":
-        return float(np.std(x))
-    if stat == "min":
-        return float(np.min(x))
-    if stat == "max":
-        return float(np.max(x))
-    if stat == "var":
-        return float(np.var(x))
-    if stat == "rms":
-        return float(np.sqrt(np.mean(x ** 2)))
-    raise ValueError(f"Unsupported stat: {stat}")
-
-
 def gyro_mag(df: pd.DataFrame, prefix: str) -> np.ndarray:
     return np.sqrt(
-        finite_or_zero(as_numeric_array(df, f"gyro_{prefix}_x")) ** 2
-        + finite_or_zero(as_numeric_array(df, f"gyro_{prefix}_y")) ** 2
-        + finite_or_zero(as_numeric_array(df, f"gyro_{prefix}_z")) ** 2
+        df[f"gyro_{prefix}_x"].to_numpy() ** 2
+        + df[f"gyro_{prefix}_y"].to_numpy() ** 2
+        + df[f"gyro_{prefix}_z"].to_numpy() ** 2
     )
 
 
 def acc_mag(df: pd.DataFrame, prefix: str) -> np.ndarray:
     return np.sqrt(
-        finite_or_zero(as_numeric_array(df, f"acc_{prefix}_x")) ** 2
-        + finite_or_zero(as_numeric_array(df, f"acc_{prefix}_y")) ** 2
-        + finite_or_zero(as_numeric_array(df, f"acc_{prefix}_z")) ** 2
+        df[f"acc_{prefix}_x"].to_numpy() ** 2
+        + df[f"acc_{prefix}_y"].to_numpy() ** 2
+        + df[f"acc_{prefix}_z"].to_numpy() ** 2
     )
 
 
@@ -208,8 +159,8 @@ def jerk(signal: np.ndarray, sampling_hz: int) -> np.ndarray:
 
 def band_energy(signal: np.ndarray, sampling_hz: int, low_hz: float, high_hz: float) -> float:
     """FFT band energy in [low_hz, high_hz]."""
-    signal = finite_or_zero(signal)
-    signal = signal - np.mean(signal)
+    signal = np.asarray(signal, dtype=float)
+    signal = signal - np.nanmean(signal)
     if len(signal) < 4:
         return 0.0
 
@@ -221,8 +172,8 @@ def band_energy(signal: np.ndarray, sampling_hz: int, low_hz: float, high_hz: fl
 
 def spectral_entropy(signal: np.ndarray, sampling_hz: int) -> float:
     """Simple normalized spectral entropy."""
-    signal = finite_or_zero(signal)
-    signal = signal - np.mean(signal)
+    signal = np.asarray(signal, dtype=float)
+    signal = signal - np.nanmean(signal)
     if len(signal) < 4:
         return 0.0
 
@@ -237,20 +188,11 @@ def spectral_entropy(signal: np.ndarray, sampling_hz: int) -> float:
 
 
 def pearson_corr_safe(a: np.ndarray, b: np.ndarray) -> float:
-    a = finite_or_zero(a)
-    b = finite_or_zero(b)
     if len(a) < 3 or len(b) < 3:
         return 0.0
     if np.nanstd(a) < 1e-9 or np.nanstd(b) < 1e-9:
         return 0.0
     return float(np.corrcoef(a, b)[0, 1])
-
-
-def has_usable_biomech_orientation(window_df: pd.DataFrame) -> bool:
-    """Pitch/roll are enough for the MVP spine flexion and roll-delta features."""
-    if not all(c in window_df.columns for c in BIOMECH_ORIENTATION_COLUMNS):
-        return False
-    return all(np.isfinite(as_numeric_array(window_df, col)).any() for col in BIOMECH_ORIENTATION_COLUMNS)
 
 
 # =========================
@@ -266,8 +208,6 @@ def load_csv_folder(data_dir: str) -> pd.DataFrame:
     dfs = []
     for path in files:
         df = pd.read_csv(path)
-        validate_required_columns(df, str(path))
-        warn_missing_optional_columns(df, str(path))
         df["source_file"] = str(path)
         dfs.append(df)
 
@@ -276,7 +216,7 @@ def load_csv_folder(data_dir: str) -> pd.DataFrame:
     numeric_cols = [
         "timestamp_ms", "rpe",
         *RAW_IMU_COLUMNS,
-        *MAG_LOW_COLUMNS,
+        *MAG_COLUMNS,
         *ORIENTATION_COLUMNS,
     ]
     data = safe_numeric(data, numeric_cols)
@@ -317,7 +257,7 @@ def run_eda(data: pd.DataFrame, output_dir: str) -> None:
             t_min = g["timestamp_ms"].min()
             t_max = g["timestamp_ms"].max()
             duration_s = max((t_max - t_min) / 1000.0, 1e-9)
-            approx_hz = max(len(g) - 1, 1) / duration_s
+            approx_hz = len(g) / duration_s
         else:
             duration_s = np.nan
             approx_hz = np.nan
@@ -373,44 +313,54 @@ def extract_posture_features(window_df: pd.DataFrame, sampling_hz: int) -> Dict[
     # Raw IMU statistical features.
     for col in RAW_IMU_COLUMNS:
         if col in window_df.columns:
-            x = as_numeric_array(window_df, col)
-            f[f"{col}_mean"] = safe_stat(x, "mean")
-            f[f"{col}_std"] = safe_stat(x, "std")
-            f[f"{col}_min"] = safe_stat(x, "min")
-            f[f"{col}_max"] = safe_stat(x, "max")
+            x = window_df[col].to_numpy(dtype=float)
+            f[f"{col}_mean"] = float(np.nanmean(x))
+            f[f"{col}_std"] = float(np.nanstd(x))
+            f[f"{col}_min"] = float(np.nanmin(x))
+            f[f"{col}_max"] = float(np.nanmax(x))
 
     # Magnitude and jerk features.
     for prefix in ["up", "low"]:
         if all(c in window_df.columns for c in [f"acc_{prefix}_x", f"acc_{prefix}_y", f"acc_{prefix}_z"]):
             a_mag = acc_mag(window_df, prefix)
             j = jerk(a_mag, sampling_hz)
-            f[f"acc_{prefix}_mag_mean"] = safe_stat(a_mag, "mean")
-            f[f"acc_{prefix}_mag_std"] = safe_stat(a_mag, "std")
-            f[f"jerk_{prefix}_max"] = safe_stat(np.abs(j), "max")
-            f[f"jerk_{prefix}_mean"] = safe_stat(np.abs(j), "mean")
+            f[f"acc_{prefix}_mag_mean"] = float(np.nanmean(a_mag))
+            f[f"acc_{prefix}_mag_std"] = float(np.nanstd(a_mag))
+            f[f"jerk_{prefix}_max"] = float(np.nanmax(np.abs(j)))
+            f[f"jerk_{prefix}_mean"] = float(np.nanmean(np.abs(j)))
 
         if all(c in window_df.columns for c in [f"gyro_{prefix}_x", f"gyro_{prefix}_y", f"gyro_{prefix}_z"]):
             g_mag = gyro_mag(window_df, prefix)
-            f[f"gyro_{prefix}_mag_mean"] = safe_stat(g_mag, "mean")
-            f[f"gyro_{prefix}_mag_std"] = safe_stat(g_mag, "std")
-            f[f"gyro_{prefix}_energy"] = safe_stat(g_mag ** 2, "mean")
+            f[f"gyro_{prefix}_mag_mean"] = float(np.nanmean(g_mag))
+            f[f"gyro_{prefix}_mag_std"] = float(np.nanstd(g_mag))
+            f[f"gyro_{prefix}_energy"] = float(np.nanmean(g_mag ** 2))
 
     # Orientation / biomechanics features if available.
-    if has_usable_biomech_orientation(window_df):
-        pitch_up = as_numeric_array(window_df, "pitch_up")
-        pitch_low = as_numeric_array(window_df, "pitch_low")
-        roll_up = as_numeric_array(window_df, "roll_up")
-        roll_low = as_numeric_array(window_df, "roll_low")
+    has_orientation = all(c in window_df.columns for c in ORIENTATION_COLUMNS)
+    if has_orientation:
+        pitch_up = window_df["pitch_up"].to_numpy(dtype=float)
+        pitch_low = window_df["pitch_low"].to_numpy(dtype=float)
+        roll_up = window_df["roll_up"].to_numpy(dtype=float)
+        roll_low = window_df["roll_low"].to_numpy(dtype=float)
+        yaw_up = window_df["yaw_up"].to_numpy(dtype=float)
+        yaw_low = window_df["yaw_low"].to_numpy(dtype=float)
 
         spine_flexion = np.abs(pitch_up - pitch_low)
         spine_roll_delta = np.abs(roll_up - roll_low)
+        # spine_yaw_delta = np.abs(yaw_up - yaw_low)
+        twist_rate_proxy = abs(gyro_up_z - gyro_low_z)
 
-        f["pitch_up_mean"] = safe_stat(pitch_up, "mean")
-        f["pitch_low_mean"] = safe_stat(pitch_low, "mean")
-        f["spine_flexion_mean"] = safe_stat(spine_flexion, "mean")
-        f["spine_flexion_max"] = safe_stat(spine_flexion, "max")
-        f["spine_roll_delta_mean"] = safe_stat(spine_roll_delta, "mean")
-        f["spine_roll_delta_max"] = safe_stat(spine_roll_delta, "max")
+        f["pitch_up_mean"] = float(np.nanmean(pitch_up))
+        f["pitch_low_mean"] = float(np.nanmean(pitch_low))
+        f["spine_flexion_mean"] = float(np.nanmean(spine_flexion))
+        f["spine_flexion_max"] = float(np.nanmax(spine_flexion))
+        f["spine_roll_delta_mean"] = float(np.nanmean(spine_roll_delta))
+        f["spine_roll_delta_max"] = float(np.nanmax(spine_roll_delta))
+        # f["spine_yaw_delta_mean"] = float(np.nanmean(spine_yaw_delta))
+        # f["spine_yaw_delta_max"] = float(np.nanmax(spine_yaw_delta))
+        f["twist_rate_proxy_mean"] = float(np.nanmean(twist_rate_proxy))
+        f["twist_rate_proxy_max"] = float(np.nanmax(twist_rate_proxy))
+        f["twist_rate_proxy_energy"] = float(np.nanmean(twist_rate_proxy ** 2))
 
     # Common-mode vibration: high correlation can indicate whole-body/environment vibration.
     try:
@@ -435,10 +385,10 @@ def extract_fatigue_features(window_df: pd.DataFrame, sampling_hz: int) -> Dict[
     energy_4_8 = band_energy(up_g, sampling_hz, 4.0, 8.0)
     energy_8_12 = band_energy(up_g, sampling_hz, 8.0, 12.0)
 
-    f["gyro_up_var"] = safe_stat(up_g, "var")
-    f["gyro_up_rms"] = safe_stat(up_g, "rms")
-    f["acc_up_var"] = safe_stat(up_a, "var")
-    f["jerk_up_mean_abs"] = safe_stat(np.abs(jerk(up_a, sampling_hz)), "mean")
+    f["gyro_up_var"] = float(np.nanvar(up_g))
+    f["gyro_up_rms"] = float(np.sqrt(np.nanmean(up_g ** 2)))
+    f["acc_up_var"] = float(np.nanvar(up_a))
+    f["jerk_up_mean_abs"] = float(np.nanmean(np.abs(jerk(up_a, sampling_hz))))
     f["fft_energy_4_8"] = float(energy_4_8)
     f["fft_energy_8_12"] = float(energy_8_12)
     f["fft_band_ratio_8_12"] = float(energy_8_12 / (total_energy + 1e-9))
@@ -518,24 +468,6 @@ def augment_feature_table(
     return pd.concat(augmented, ignore_index=True)
 
 
-def feature_columns(df: pd.DataFrame, extra_meta_cols: Optional[set[str]] = None) -> List[str]:
-    meta_cols = {
-        "trial_id", "subject_id", "label", "risk_label", "session_phase", "rpe",
-        "load_level", "label_quality", "window_start_ms", "window_end_ms",
-    }
-    if extra_meta_cols:
-        meta_cols.update(extra_meta_cols)
-    return [c for c in df.columns if c not in meta_cols and pd.api.types.is_numeric_dtype(df[c])]
-
-
-def clean_feature_values(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
-    """Keep optional missing features from deleting rows; fill remaining feature holes conservatively."""
-    cleaned = df.copy()
-    cleaned[feature_cols] = cleaned[feature_cols].replace([np.inf, -np.inf], np.nan)
-    cleaned[feature_cols] = cleaned[feature_cols].fillna(0.0)
-    return cleaned
-
-
 # =========================
 # Model 1: Posture Classifier
 # =========================
@@ -545,21 +477,8 @@ def prepare_posture_dataset(features_df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["label_quality"] == "clean"].copy()
     df["train_class"] = df["label"].map(TRAIN_CLASS_MAP)
     df = df[df["train_class"].notna()].copy()
-    feat_cols = feature_columns(df, {"train_class"})
-    df = clean_feature_values(df, feat_cols)
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(axis=0)
     return df
-
-
-def safe_stratify_target(df: pd.DataFrame, target_col: str) -> Optional[pd.Series]:
-    """Return a stratification target only when sklearn can safely use it."""
-    counts = df[target_col].value_counts()
-    if len(counts) < 2 or counts.min() < 2:
-        warnings.warn(
-            f"Skipping stratification for {target_col}; at least one class has fewer than two samples.",
-            stacklevel=2,
-        )
-        return None
-    return df[target_col]
 
 
 def split_by_subject(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -569,132 +488,30 @@ def split_by_subject(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.D
     """
     subjects = sorted(df["subject_id"].dropna().unique())
     if len(subjects) >= 3:
-        groups = df["subject_id"].to_numpy()
-        first_split = GroupShuffleSplit(n_splits=1, train_size=0.7, random_state=CONFIG.random_state)
-        train_idx, temp_idx = next(first_split.split(df, groups=groups))
-        train_df = df.iloc[train_idx].copy()
-        temp_df = df.iloc[temp_idx].copy()
-
-        temp_subjects = temp_df["subject_id"].nunique()
-        if temp_subjects >= 2:
-            second_split = GroupShuffleSplit(n_splits=1, train_size=0.5, random_state=CONFIG.random_state)
-            val_rel_idx, test_rel_idx = next(second_split.split(temp_df, groups=temp_df["subject_id"].to_numpy()))
-            val_df = temp_df.iloc[val_rel_idx].copy()
-            test_df = temp_df.iloc[test_rel_idx].copy()
-        else:
-            warnings.warn(
-                "Person-based split produced only one holdout subject. Validation and test will share a random split "
-                "within that subject.",
-                stacklevel=2,
-            )
-            val_df, test_df = train_test_split(
-                temp_df,
-                test_size=0.5,
-                random_state=CONFIG.random_state,
-                stratify=safe_stratify_target(temp_df, "train_class"),
-            )
-
-        missing_train_classes = sorted(set(df["train_class"]) - set(train_df["train_class"]))
-        if missing_train_classes:
-            warnings.warn(
-                f"Training split is missing classes {missing_train_classes}. Add more subjects per class if possible.",
-                stacklevel=2,
-            )
+        train_subjects = subjects[:-2]
+        val_subjects = [subjects[-2]]
+        test_subjects = [subjects[-1]]
+        train_df = df[df["subject_id"].isin(train_subjects)].copy()
+        val_df = df[df["subject_id"].isin(val_subjects)].copy()
+        test_df = df[df["subject_id"].isin(test_subjects)].copy()
         return train_df, val_df, test_df
 
     warnings.warn("Fewer than 3 subjects found. Falling back to random split; this may overestimate performance.")
-    train_df, temp_df = train_test_split(
-        df,
-        test_size=0.3,
-        random_state=CONFIG.random_state,
-        stratify=safe_stratify_target(df, "train_class"),
-    )
-    val_df, test_df = train_test_split(
-        temp_df,
-        test_size=0.5,
-        random_state=CONFIG.random_state,
-        stratify=safe_stratify_target(temp_df, "train_class"),
-    )
+    train_df, temp_df = train_test_split(df, test_size=0.3, random_state=CONFIG.random_state, stratify=df["train_class"])
+    val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=CONFIG.random_state, stratify=temp_df["train_class"])
     return train_df, val_df, test_df
-
-
-def evaluate_posture_classifier(
-    model: RandomForestClassifier,
-    X: np.ndarray,
-    y: np.ndarray,
-    split_name: str,
-    output_dir: str,
-) -> Dict[str, float]:
-    if len(y) == 0:
-        warnings.warn(f"No rows available for posture {split_name} evaluation.", stacklevel=2)
-        return {"macro_f1": np.nan, "log_loss": np.nan}
-
-    pred = model.predict(X)
-    labels = sorted(set(model.classes_) | set(y))
-
-    print(f"\n=== Posture classifier: {split_name} ===")
-    print(classification_report(y, pred, labels=labels, zero_division=0))
-    cm = confusion_matrix(y, pred, labels=labels)
-    print(cm)
-
-    report = classification_report(y, pred, labels=labels, zero_division=0, output_dict=True)
-    with open(Path(output_dir) / f"posture_{split_name}_report.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-    pd.DataFrame(cm, index=labels, columns=labels).to_csv(Path(output_dir) / f"posture_{split_name}_confusion_matrix.csv")
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
-    ax.figure.colorbar(im, ax=ax)
-    ax.set(
-        xticks=np.arange(len(labels)),
-        yticks=np.arange(len(labels)),
-        xticklabels=labels,
-        yticklabels=labels,
-        ylabel="True label",
-        xlabel="Predicted label",
-        title=f"Posture confusion matrix ({split_name})",
-    )
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center", color="black")
-    fig.tight_layout()
-    fig.savefig(Path(output_dir) / f"posture_{split_name}_confusion_matrix.png", dpi=160)
-    plt.close(fig)
-
-    macro_f1 = f1_score(y, pred, average="macro", zero_division=0)
-    loss = np.nan
-    known_mask = np.isin(y, model.classes_)
-    if known_mask.any():
-        proba = model.predict_proba(X[known_mask])
-        loss = float(log_loss(y[known_mask], proba, labels=list(model.classes_)))
-
-    return {"macro_f1": float(macro_f1), "log_loss": loss}
-
-
-def plot_posture_metrics(metrics: Dict[str, Dict[str, float]], output_dir: str) -> None:
-    metric_df = pd.DataFrame(metrics).T
-    metric_df.to_csv(Path(output_dir) / "posture_eval_metrics.csv")
-
-    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
-    metric_df["macro_f1"].plot(kind="bar", ax=axes[0], color="#2f80ed", ylim=(0, 1), title="Macro F1")
-    metric_df["log_loss"].plot(kind="bar", ax=axes[1], color="#eb5757", title="Log loss")
-    for ax in axes:
-        ax.set_xlabel("")
-        ax.tick_params(axis="x", rotation=0)
-    fig.tight_layout()
-    fig.savefig(Path(output_dir) / "posture_f1_loss.png", dpi=160)
-    plt.close(fig)
 
 
 def train_posture_classifier(features_df: pd.DataFrame, output_dir: str) -> None:
     ensure_dir(output_dir)
     df = prepare_posture_dataset(features_df)
-    if df.empty:
-        raise ValueError("No clean posture windows with known train_class labels were found.")
-
     train_df, val_df, test_df = split_by_subject(df)
-    feature_cols = feature_columns(df, {"train_class"})
+
+    meta_cols = {
+        "trial_id", "subject_id", "label", "risk_label", "session_phase", "rpe",
+        "load_level", "label_quality", "window_start_ms", "window_end_ms", "train_class",
+    }
+    feature_cols = [c for c in df.columns if c not in meta_cols and pd.api.types.is_numeric_dtype(df[c])]
 
     train_aug = augment_feature_table(
         train_df,
@@ -720,11 +537,18 @@ def train_posture_classifier(features_df: pd.DataFrame, output_dir: str) -> None
     )
     model.fit(X_train, y_train)
 
-    metrics = {
-        "validation": evaluate_posture_classifier(model, X_val, y_val, "validation", output_dir),
-        "test": evaluate_posture_classifier(model, X_test, y_test, "test", output_dir),
-    }
-    plot_posture_metrics(metrics, output_dir)
+    for split_name, X, y in [
+        ("validation", X_val, y_val),
+        ("test", X_test, y_test),
+    ]:
+        pred = model.predict(X)
+        print(f"\n=== Posture classifier: {split_name} ===")
+        print(classification_report(y, pred, zero_division=0))
+        print(confusion_matrix(y, pred, labels=model.classes_))
+
+        report = classification_report(y, pred, zero_division=0, output_dict=True)
+        with open(Path(output_dir) / f"posture_{split_name}_report.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
 
     artifacts = {
         "model": model,
@@ -743,8 +567,7 @@ def train_posture_classifier(features_df: pd.DataFrame, output_dir: str) -> None
 def prepare_fatigue_dataset(features_df: pd.DataFrame) -> pd.DataFrame:
     df = features_df.copy()
     df = df[df["label_quality"] == "clean"].copy()
-    feat_cols = feature_columns(df)
-    df = clean_feature_values(df, feat_cols)
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(axis=0)
     return df
 
 
@@ -759,7 +582,11 @@ def train_gaussian_fatigue_model(features_df: pd.DataFrame, output_dir: str) -> 
     if len(baseline_df) < 10:
         raise ValueError("Not enough fresh_baseline windows for Gaussian fatigue model. Need at least ~10 windows.")
 
-    feature_cols = feature_columns(df)
+    meta_cols = {
+        "trial_id", "subject_id", "label", "risk_label", "session_phase", "rpe",
+        "load_level", "label_quality", "window_start_ms", "window_end_ms",
+    }
+    feature_cols = [c for c in df.columns if c not in meta_cols and pd.api.types.is_numeric_dtype(df[c])]
 
     scaler = StandardScaler()
     X_base = scaler.fit_transform(baseline_df[feature_cols].to_numpy(dtype=float))
@@ -796,10 +623,7 @@ def train_gaussian_fatigue_model(features_df: pd.DataFrame, output_dir: str) -> 
 # Inference examples
 # =========================
 
-def predict_posture_from_window(
-    window_df: pd.DataFrame,
-    model_path: str | Path = Path(CONFIG.output_dir) / "posture_classifier.joblib",
-) -> Dict[str, object]:
+def predict_posture_from_window(window_df: pd.DataFrame, model_path: str) -> Dict[str, object]:
     artifacts = joblib.load(model_path)
     model = artifacts["model"]
     feature_cols = artifacts["feature_cols"]
@@ -816,10 +640,7 @@ def predict_posture_from_window(
     }
 
 
-def score_fatigue_from_window(
-    window_df: pd.DataFrame,
-    model_path: str | Path = Path(CONFIG.output_dir) / "gaussian_fatigue_proxy.joblib",
-) -> Dict[str, object]:
+def score_fatigue_from_window(window_df: pd.DataFrame, model_path: str) -> Dict[str, object]:
     artifacts = joblib.load(model_path)
     scaler = artifacts["scaler"]
     gaussian = artifacts["gaussian"]
