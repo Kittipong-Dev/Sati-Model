@@ -1,0 +1,59 @@
+{
+  "num_rows": 24000,
+  "num_trials": 40,
+  "num_subjects": 5,
+  "labels": {
+    "safe_lift_motion": 3000,
+    "unsafe_flexion_motion": 3000,
+    "unsafe_twist_motion": 3000,
+    "bend_no_load": 3000,
+    "sit_bend": 3000,
+    "walk": 3000,
+    "sit": 3000,
+    "transit_noise": 3000
+  },
+  "risk_labels": {
+    "non_risk_bend": 6000,
+    "normal_activity": 6000,
+    "safe_lift": 3000,
+    "stoop_risk": 3000,
+    "twist_risk": 3000,
+    "transit_ignore": 3000
+  },
+  "session_phase": {
+    "fresh_baseline": 6000,
+    "repeated_task": 6000,
+    "fatigue_like": 6000,
+    "recovery": 6000
+  },
+  "label_quality": {
+    "clean": 24000
+  },
+  "missing_rate_top30": {
+    "trial_id": 0.0,
+    "subject_id": 0.0,
+    "timestamp_ms": 0.0,
+    "label": 0.0,
+    "risk_label": 0.0,
+    "session_phase": 0.0,
+    "rpe": 0.0,
+    "load_level": 0.0,
+    "label_quality": 0.0,
+    "acc_up_x": 0.0,
+    "acc_up_y": 0.0,
+    "acc_up_z": 0.0,
+    "gyro_up_x": 0.0,
+    "gyro_up_y": 0.0,
+    "gyro_up_z": 0.0,
+    "acc_low_x": 0.0,
+    "acc_low_y": 0.0,
+    "acc_low_z": 0.0,
+    "gyro_low_x": 0.0,
+    "gyro_low_y": 0.0,
+    "gyro_low_z": 0.0,
+    "mag_low_x": 0.0,
+    "mag_low_y": 0.0,
+    "mag_low_z": 0.0,
+    "source_file": 0.0
+  }
+}

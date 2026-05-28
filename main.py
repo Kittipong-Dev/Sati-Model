@@ -16,7 +16,6 @@ Expected CSV schema, minimum:
 trial_id,subject_id,timestamp_ms,label,risk_label,session_phase,rpe,load_level,label_quality,
 acc_up_x,acc_up_y,acc_up_z,
 gyro_up_x,gyro_up_y,gyro_up_z,
-mag_up_x,mag_up_y,mag_up_z,
 acc_low_x,acc_low_y,acc_low_z,
 gyro_low_x,gyro_low_y,gyro_low_z,
 mag_low_x,mag_low_y,mag_low_z,
@@ -24,7 +23,7 @@ pitch_up,roll_up,yaw_up,
 pitch_low,roll_low,yaw_low
 
 If pitch/roll/yaw are not available, this script can still run using raw IMU features,
-but physics features related to spine_flexion/spine_twist will be skipped unless orientation is computed later.
+but orientation features related to spine_flexion/spine_roll_delta will be skipped unless orientation is computed later.
 """
 
 from __future__ import annotations
@@ -84,11 +83,6 @@ RAW_IMU_COLUMNS = [
     "acc_low_x", "acc_low_y", "acc_low_z",
     "gyro_low_x", "gyro_low_y", "gyro_low_z",
 ]
-
-# MAG_COLUMNS = [
-#     "mag_up_x", "mag_up_y", "mag_up_z",
-#     "mag_low_x", "mag_low_y", "mag_low_z",
-# ]
 
 MAG_COLUMNS = [
     "mag_low_x", "mag_low_y", "mag_low_z",
@@ -335,6 +329,13 @@ def extract_posture_features(window_df: pd.DataFrame, sampling_hz: int) -> Dict[
             f[f"gyro_{prefix}_mag_std"] = float(np.nanstd(g_mag))
             f[f"gyro_{prefix}_energy"] = float(np.nanmean(g_mag ** 2))
 
+    twist_rate_proxy = np.abs(
+        window_df["gyro_up_z"].to_numpy(dtype=float) - window_df["gyro_low_z"].to_numpy(dtype=float)
+    )
+    f["twist_rate_proxy_mean"] = float(np.nanmean(twist_rate_proxy))
+    f["twist_rate_proxy_max"] = float(np.nanmax(twist_rate_proxy))
+    f["twist_rate_proxy_energy"] = float(np.nanmean(twist_rate_proxy ** 2))
+
     # Orientation / biomechanics features if available.
     has_orientation = all(c in window_df.columns for c in ORIENTATION_COLUMNS)
     if has_orientation:
@@ -348,7 +349,6 @@ def extract_posture_features(window_df: pd.DataFrame, sampling_hz: int) -> Dict[
         spine_flexion = np.abs(pitch_up - pitch_low)
         spine_roll_delta = np.abs(roll_up - roll_low)
         # spine_yaw_delta = np.abs(yaw_up - yaw_low)
-        twist_rate_proxy = abs(gyro_up_z - gyro_low_z)
 
         f["pitch_up_mean"] = float(np.nanmean(pitch_up))
         f["pitch_low_mean"] = float(np.nanmean(pitch_low))
@@ -358,9 +358,6 @@ def extract_posture_features(window_df: pd.DataFrame, sampling_hz: int) -> Dict[
         f["spine_roll_delta_max"] = float(np.nanmax(spine_roll_delta))
         # f["spine_yaw_delta_mean"] = float(np.nanmean(spine_yaw_delta))
         # f["spine_yaw_delta_max"] = float(np.nanmax(spine_yaw_delta))
-        f["twist_rate_proxy_mean"] = float(np.nanmean(twist_rate_proxy))
-        f["twist_rate_proxy_max"] = float(np.nanmax(twist_rate_proxy))
-        f["twist_rate_proxy_energy"] = float(np.nanmean(twist_rate_proxy ** 2))
 
     # Common-mode vibration: high correlation can indicate whole-body/environment vibration.
     try:
